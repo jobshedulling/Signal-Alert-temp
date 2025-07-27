@@ -6,14 +6,17 @@ import numpy as np
 import time
 from datetime import datetime, time
 import pytz
+import os
 from statsmodels.tsa.stattools import coint
 from sklearn.linear_model import LinearRegression
 
+
 # ===== Configuration =====
-TELEGRAM_BOT_TOKEN = '8166933907:AAEc3VDuG3ThNrcwSUoLd4LKlg9im9MpS6I'
-TELEGRAM_CHAT_ID = '482409971'
-TWELVEDATA_API_KEY = "a3c93cebd7dc468e8f03927ace7ec660"
-GOLDAPI_KEY = "02b909e1-7648-4f05-8032-0e22d3ebaa5c"
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
+GOLDAPI_KEY = os.getenv("GOLDAPI_KEY")
+
 
 API_CALL_DELAY = 8  # Seconds between API calls
 REALTIME_API_URL = "https://api.twelvedata.com/price"
