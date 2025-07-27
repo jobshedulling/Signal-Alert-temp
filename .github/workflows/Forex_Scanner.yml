@@ -2,8 +2,8 @@ name: Forex Scanner Schedule
 
 on:
   schedule:
-    # Runs every 15 minutes
-    - cron: "*/15 * * * *"
+    # Run every hour from Mon 00:00 to Fri 18:00 UTC (matches UK time)
+    - cron: "0 0-18 * * 1-5"
   workflow_dispatch:
 
 jobs:
@@ -22,7 +22,9 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install requests pandas pandas_ta numpy pytz statsmodels scikit-learn
+        pip install requests pandas numpy pytz statsmodels scikit-learn
+        # Use fixed pandas_ta fork with NaN import fix
+        pip install git+https://github.com/twopirllc/pandas-ta.git
 
     - name: Run Enhanced Scanner
       env:
