@@ -10,13 +10,11 @@ import os
 from statsmodels.tsa.stattools import coint
 from sklearn.linear_model import LinearRegression
 
-
 # ===== Configuration =====
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
 GOLDAPI_KEY = os.getenv("GOLDAPI_KEY")
-
 
 API_CALL_DELAY = 8  # Seconds between API calls
 REALTIME_API_URL = "https://api.twelvedata.com/price"
@@ -35,7 +33,6 @@ class EnhancedScanner:
                 'name': 'Asian Range Breakout',
                 'pairs': ['AUD/USD', 'NZD/USD', 'USD/JPY'],
                 'timeframe': '15min',
-                # Updated active window: 00:30 to 06:00 UK time
                 'active_window': (time(0, 30), time(6, 0)), 
                 'active_days': [0, 1, 2, 3, 4],  # Monday(0) to Friday(4)
                 'function': self.asian_range_breakout_strategy,
@@ -300,6 +297,22 @@ class EnhancedScanner:
             return False
     
     def scan(self):
+        # ===== GLOBAL TIME CHECK =====
+        now = self.get_uk_time()
+        current_day = now.weekday()  # Monday=0, Sunday=6
+        current_hour = now.hour
+        
+        # Skip weekends (Saturday=5, Sunday=6)
+        if current_day >= 5:
+            print("Skipping scan: Weekend")
+            return
+            
+        # Skip Friday after 18:00 UK time
+        if current_day == 4 and current_hour > 18:  # Friday=4
+            print("Skipping scan: Friday after 18:00")
+            return
+        # =============================
+            
         print(f"\n🔍 Starting Enhanced Scanner at {self.scan_time}")
         scan_results = []
         signal_count = 0
