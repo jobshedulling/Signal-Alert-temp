@@ -4,21 +4,33 @@ import pandas as pd
 import pandas_ta as ta
 import numpy as np
 import time as t
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 import pytz
 from statsmodels.tsa.stattools import coint
 from sklearn.linear_model import LinearRegression
+import calendar
 
-# ===== Configuration =====
+# ===== Consolidated API Configuration =====
 TELEGRAM_BOT_TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
 TELEGRAM_CHAT_ID = os.environ['TELEGRAM_CHAT_ID']
-TWELVEDATA_API_KEY = os.environ['TWELVEDATA_API_KEY']
-GOLDAPI_KEY = os.environ['GOLDAPI_KEY']
+API_KEY = os.environ['TWELVEDATA_API_KEY']
 
+# API rate management
+API_CALL_COUNTER = 0
 API_CALL_DELAY = 8  # Seconds between API calls
-REALTIME_API_URL = "https://api.twelvedata.com/price"
-OHLC_API_URL = "https://api.twelvedata.com/time_series"
-GOLDAPI_URL = "https://www.goldapi.io/api/XAUUSD"
+LAST_RESET_MONTH = datetime.utcnow().month
+
+def reset_api_counter_if_needed():
+    global API_CALL_COUNTER, LAST_RESET_MONTH
+    current_month = datetime.utcnow().month
+    if current_month != LAST_RESET_MONTH:
+        API_CALL_COUNTER = 0
+        LAST_RESET_MONTH = current_month
+        print(f"API counter reset for new month: {calendar.month_name[current_month]}")
+
+BASE_URL = "https://api.twelvedata.com"
+REALTIME_ENDPOINT = f"{BASE_URL}/price"
+OHLC_ENDPOINT = f"{BASE_URL}/time_series"
 
 class EnhancedScanner:
     def __init__(self):
@@ -34,17 +46,15 @@ class EnhancedScanner:
                 'timeframe': '15min',
                 'active_window': (time(0, 30), time(6, 0)), 
                 'active_days': [0, 1, 2, 3, 4],  # Monday(0) to Friday(4)
-                'function': self.asian_range_breakout_strategy,
-                'data_source': 'twelvedata'
+                'function': self.asian_range_breakout_strategy
             },
             {
                 'name': 'Gold CMAR Strategy',
                 'pairs': ['XAU/USD'],
                 'timeframe': '1h',
-                'active_window': (time(9, 0), time(17, 0)),  # 9am-5pm UK time
-                'active_days': [0, 1, 2, 3],  # Tue(1), Wed(2), Thu(3)
-                'function': self.gold_strategy,
-                'data_source': 'goldapi'
+                'active_window': (time(9, 0), time(16, 0)),  # 9am-4pm UK time (7 hours)
+                'active_days': [0, 1, 2, 3, 4],  # Monday to Friday
+                'function': self.gold_strategy
             }
         ]
         
@@ -64,99 +74,82 @@ class EnhancedScanner:
         start, end = strategy['active_window']
         return start <= current_time < end
     
-    def get_current_price(self, pair, data_source):
-        if data_source == 'twelvedata':
-            params = {"symbol": pair, "apikey": TWELVEDATA_API_KEY}
-            try:
-                response = requests.get(REALTIME_API_URL, params=params, timeout=15)
-                data = response.json()
-                return float(data['price'])
-            except:
-                return None
-                
-        elif data_source == 'goldapi':
-            headers = {"x-access-token": GOLDAPI_KEY}
-            try:
-                response = requests.get(GOLDAPI_URL, headers=headers, timeout=15)
-                data = response.json()
-                return float(data['price'])
-            except:
-                return None
+    def api_call(self, endpoint, params=None):
+        """Make API call with rate limit management"""
+        global API_CALL_COUNTER
+        reset_api_counter_if_needed()
+        
+        # Add API key to parameters
+        params = params or {}
+        params["apikey"] = API_KEY
+        
+        try:
+            # Respect API call delay
+            t.sleep(API_CALL_DELAY)
+            
+            response = requests.get(endpoint, params=params, timeout=15)
+            API_CALL_COUNTER += 1
+            return response.json()
+        except Exception as e:
+            print(f"API Error: {str(e)}")
+            return None
     
-    def fetch_ohlc_data(self, pair, timeframe, data_source):
-        if data_source == 'twelvedata':
-            params = {
-                "symbol": pair,
-                "interval": timeframe,
-                "outputsize": 100,
-                "apikey": TWELVEDATA_API_KEY,
-                "timezone": "Europe/London"
-            }
-            try:
-                response = requests.get(OHLC_API_URL, params=params, timeout=20)
-                data = response.json()
-                
-                if 'values' not in data:
-                    return None
-                    
-                df = pd.DataFrame(data['values'])
-                df = df.iloc[::-1].reset_index(drop=True)
-                
-                for col in ['open', 'high', 'low', 'close']:
-                    if col in df: 
-                        df[col] = pd.to_numeric(df[col], errors='coerce')
-                
-                if 'datetime' in df:
-                    df['datetime'] = pd.to_datetime(df['datetime'])
-                    df['datetime'] = df['datetime'].dt.tz_localize('UTC').dt.tz_convert('Europe/London')
-                    df['hour'] = df['datetime'].dt.hour
-                    df['time'] = df['datetime'].dt.time
-                else:
-                    now = datetime.now(self.uk_tz)
-                    df['datetime'] = pd.date_range(end=now, periods=len(df), freq=timeframe)
-                    df['hour'] = df['datetime'].dt.hour
-                    df['time'] = df['datetime'].dt.time
-                
-                df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
-                return df.dropna()
-            except:
-                return None
-                
-        elif data_source == 'goldapi':
-            headers = {"x-access-token": GOLDAPI_KEY}
-            end_date = datetime.now(self.uk_tz)
-            start_date = end_date - pd.Timedelta(days=90)
+    def get_current_price(self, pair):
+        """Get current price using TwelveData API"""
+        params = {"symbol": pair}
+        data = self.api_call(REALTIME_ENDPOINT, params)
+        return float(data['price']) if data and 'price' in data else None
+    
+    def fetch_ohlc_data(self, pair, timeframe):
+        """Fetch OHLC data using TwelveData API"""
+        params = {
+            "symbol": pair,
+            "interval": timeframe,
+            "outputsize": 100,
+            "timezone": "Europe/London"
+        }
+        data = self.api_call(OHLC_ENDPOINT, params)
+        
+        if not data or 'values' not in data:
+            return None
             
-            params = {
-                "start_date": start_date.strftime("%Y-%m-%d"),
-                "end_date": end_date.strftime("%Y-%m-%d"),
-                "timeframe": timeframe
-            }
+        df = pd.DataFrame(data['values'])
+        df = df.iloc[::-1].reset_index(drop=True)
+        
+        # Process numeric columns
+        for col in ['open', 'high', 'low', 'close']:
+            if col in df: 
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        # Process datetime
+        if 'datetime' in df:
+            df['datetime'] = pd.to_datetime(df['datetime'])
+            df['datetime'] = df['datetime'].dt.tz_localize('UTC').dt.tz_convert('Europe/London')
+            df['hour'] = df['datetime'].dt.hour
+            df['time'] = df['datetime'].dt.time
+        else:
+            now = datetime.now(self.uk_tz)
+            df['datetime'] = pd.date_range(end=now, periods=len(df), freq=timeframe)
+            df['hour'] = df['datetime'].dt.hour
+            df['time'] = df['datetime'].dt.time
+        
+        # Calculate technical indicators
+        df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+        
+        # Additional processing for Gold strategy
+        if pair == 'XAU/USD':
+            df["S_3"] = df["close"].rolling(3).mean()
+            df["S_9"] = df["close"].rolling(9).mean()
             
+            # Cointegration check
             try:
-                response = requests.get(GOLDAPI_URL, headers=headers, params=params, timeout=20)
-                data = response.json()
-                df = pd.DataFrame(data["data"])
-                df["time"] = pd.to_datetime(df["time"])
-                df.set_index("time", inplace=True)
-                df = df.tz_convert('Europe/London')
-                
-                # Calculate required indicators
-                df["S_3"] = df["close"].rolling(3).mean()
-                df["S_9"] = df["close"].rolling(9).mean()
-                df["atr"] = ta.atr(df["high"], df["low"], df["close"], length=14)
-                
-                # Cointegration check
                 _, pvalue_3, _ = coint(df["S_3"], df["close"])
                 _, pvalue_9, _ = coint(df["S_9"], df["close"])
                 df["cointegrated"] = (pvalue_3 < 0.05) & (pvalue_9 < 0.05)
-                
-                df.reset_index(inplace=True)
-                return df.dropna()
             except:
-                return None
-                
-        return None
+                df["cointegrated"] = False
+        
+        return df.dropna()
     
     # ===== Strategy Implementations =====
     def asian_range_breakout_strategy(self, df, current_price):
@@ -235,18 +228,21 @@ class EnhancedScanner:
             # Predict next close
             pred = model.predict(features)[0]
             
-            # Generate signal
-            if pred > current_price + (20/10):  # 20 pip target (1 pip = $0.10)
+            # Generate signal (20 pip target)
+            pip_value = 10  # For Gold (XAU/USD)
+            pip_threshold = 20 / pip_value
+            
+            if pred > current_price + pip_threshold:
                 return {
                     'direction': 'BUY', 
                     'predicted_price': pred,
-                    'pip_value': 10  # For Gold (XAU/USD)
+                    'pip_value': pip_value
                 }
-            elif pred < current_price - (20/10):
+            elif pred < current_price - pip_threshold:
                 return {
                     'direction': 'SELL', 
                     'predicted_price': pred,
-                    'pip_value': 10
+                    'pip_value': pip_value
                 }
             
             return None
@@ -313,6 +309,7 @@ class EnhancedScanner:
         # =============================
             
         print(f"\n🔍 Starting Enhanced Scanner at {self.scan_time}")
+        print(f"API calls this month: {API_CALL_COUNTER}")
         scan_results = []
         signal_count = 0
         
@@ -325,12 +322,11 @@ class EnhancedScanner:
                 continue
                 
             for pair in strategy['pairs']:
-                t.sleep(API_CALL_DELAY)  # Fixed: Using t.sleep instead of time.sleep
                 print(f"\nScanning {pair}...")
                 pair_status = f"{strategy_name} - {pair}: "
                 
                 # Get current price
-                current_price = self.get_current_price(pair, strategy['data_source'])
+                current_price = self.get_current_price(pair)
                 if current_price is None:
                     pair_status += "❌ Price fetch failed"
                     scan_results.append(pair_status)
@@ -340,7 +336,7 @@ class EnhancedScanner:
                     print(f"  Current price: {current_price:.5f}")
                 
                 # Get OHLC data
-                df = self.fetch_ohlc_data(pair, strategy['timeframe'], strategy['data_source'])
+                df = self.fetch_ohlc_data(pair, strategy['timeframe'])
                 if df is None or len(df) < 20:
                     pair_status += "❌ Data fetch failed"
                     scan_results.append(pair_status)
@@ -424,7 +420,7 @@ if __name__ == "__main__":
     print("=" * 40)
     print("Strategies:")
     print("- Asian Range Breakout (00:30-06:00 UK, Mon-Fri, Forex pairs)")
-    print("- Gold CMAR Strategy (9am-5pm UK Tue-Thu, XAU/USD)\n")
+    print("- Gold CMAR Strategy (9am-4pm UK Mon-Fri, XAU/USD)\n")
     
     scanner = EnhancedScanner()
     scanner.scan()
