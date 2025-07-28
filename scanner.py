@@ -11,9 +11,9 @@ from sklearn.linear_model import LinearRegression
 import calendar
 
 # ===== Consolidated API Configuration =====
-TELEGRAM_BOT_TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
-TELEGRAM_CHAT_ID = os.environ['TELEGRAM_CHAT_ID']
-API_KEY = os.environ['TWELVEDATA_API_KEY']
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
+API_KEY = os.environ.get('TWELVEDATA_API_KEY', '')
 
 # API rate management
 API_CALL_COUNTER = 0
@@ -88,6 +88,7 @@ class EnhancedScanner:
             t.sleep(API_CALL_DELAY)
             
             response = requests.get(endpoint, params=params, timeout=15)
+            response.raise_for_status()
             API_CALL_COUNTER += 1
             return response.json()
         except Exception as e:
@@ -98,7 +99,12 @@ class EnhancedScanner:
         """Get current price using TwelveData API"""
         params = {"symbol": pair}
         data = self.api_call(REALTIME_ENDPOINT, params)
-        return float(data['price']) if data and 'price' in data else None
+        if data and 'price' in data:
+            try:
+                return float(data['price'])
+            except:
+                pass
+        return None
     
     def fetch_ohlc_data(self, pair, timeframe):
         """Fetch OHLC data using TwelveData API"""
@@ -208,7 +214,7 @@ class EnhancedScanner:
         
         try:
             # Only use cointegrated periods
-            if not df.iloc[-1]['cointegrated']:
+            if not df.iloc[-1].get('cointegrated', False):
                 return None
                 
             # Prepare features
@@ -217,13 +223,20 @@ class EnhancedScanner:
                 "S_9": [df.iloc[-1]['S_9']]
             })
             
-            # Train model
-            train_df = df[df["cointegrated"]]
+            # Train model - FIXED: Ensure equal sample sizes
+            train_df = df[df["cointegrated"]].copy()
             if len(train_df) < 50:
                 return None
                 
+            # Create target (next period's close)
+            train_df['target'] = train_df['close'].shift(-1)
+            train_df = train_df.dropna(subset=['target'])
+            
+            if len(train_df) < 2:
+                return None
+                
             model = LinearRegression()
-            model.fit(train_df[["S_3", "S_9"]], train_df["close"].shift(-1).dropna())
+            model.fit(train_df[["S_3", "S_9"]], train_df['target'])
             
             # Predict next close
             pred = model.predict(features)[0]
