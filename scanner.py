@@ -3,18 +3,17 @@ import requests
 import pandas as pd
 import pandas_ta as ta
 import numpy as np
-import time
+import time as t
 from datetime import datetime, time
 import pytz
-import os
 from statsmodels.tsa.stattools import coint
 from sklearn.linear_model import LinearRegression
 
 # ===== Configuration =====
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
-GOLDAPI_KEY = os.getenv("GOLDAPI_KEY")
+TELEGRAM_BOT_TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
+TELEGRAM_CHAT_ID = os.environ['TELEGRAM_CHAT_ID']
+TWELVEDATA_API_KEY = os.environ['TWELVEDATA_API_KEY']
+GOLDAPI_KEY = os.environ['GOLDAPI_KEY']
 
 API_CALL_DELAY = 8  # Seconds between API calls
 REALTIME_API_URL = "https://api.twelvedata.com/price"
@@ -326,7 +325,7 @@ class EnhancedScanner:
                 continue
                 
             for pair in strategy['pairs']:
-                time.sleep(API_CALL_DELAY)
+                t.sleep(API_CALL_DELAY)  # Fixed: Using t.sleep instead of time.sleep
                 print(f"\nScanning {pair}...")
                 pair_status = f"{strategy_name} - {pair}: "
                 
