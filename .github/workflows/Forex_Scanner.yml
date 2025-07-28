@@ -2,13 +2,13 @@ name: Forex Scanner Schedule
 
 on:
   schedule:
-    # Run every hour from Mon 00:00 to Fri 18:00 UTC (matches UK time)
-    - cron: "0 0-18 * * 1-5"
+    - cron: "0 0-18 * * 1-5"  # Every hour 00:00-18:00 UTC Mon-Fri
   workflow_dispatch:
 
 jobs:
   run-scanner:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
     - name: Checkout code
@@ -22,9 +22,8 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install requests pandas numpy pytz statsmodels scikit-learn
-        # Install specific version of pandas_ta that works
-        pip install pandas-ta==0.3.14b0
+        pip install requests pandas numpy pytz statsmodels scikit-learn pandas_ta==0.3.14b0
+        sudo apt-get install -y libatlas-base-dev  # Fix for numpy issues
 
     - name: Run Enhanced Scanner
       env:
