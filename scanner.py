@@ -42,7 +42,7 @@ class EnhancedScanner:
                 'pairs': ['XAU/USD'],
                 'timeframe': '1h',
                 'active_window': (time(9, 0), time(17, 0)),  # 9am-5pm UK time
-                'active_days': [1, 2, 3],  # Tue(1), Wed(2), Thu(3)
+                'active_days': [0, 1, 2, 3],  # Tue(1), Wed(2), Thu(3)
                 'function': self.gold_strategy,
                 'data_source': 'goldapi'
             }
