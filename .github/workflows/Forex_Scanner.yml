@@ -2,12 +2,13 @@ name: Football Scanner
 
 on:
   schedule:
-    - cron: '0 3 * * *'  # 3 AM UK time daily (auto-adjusts for BST/GMT)
-  workflow_dispatch:      # Manual trigger option
+    # Run every 4 days at 3 AM UK time
+    - cron: '0 3 */4 * *'
+  workflow_dispatch:  # Allow manual triggering
 
 permissions:
   contents: read
-  issues: write  # This allows the workflow to create issues
+  issues: write
 
 jobs:
   run-scanner:
