@@ -83,6 +83,11 @@ def get_fixtures(date):
                         debug_log(f"Added {league_name} fixture: {fixture_data['home']} vs {fixture_data['away']}")
                     except KeyError as e:
                         debug_log(f"Skipping fixture due to missing data: {str(e)}")
+            elif response.status_code == 403:
+                debug_log("API rate limit exceeded or access denied")
+                break
+            elif response.status_code == 404:
+                debug_log(f"No data available for {league_name} on {date}")
             else:
                 debug_log(f"FootballData Error for {league_name}: {response.text[:200]}")
             
@@ -214,20 +219,50 @@ def analyze_fixture(fixture):
     
     return predictions
 
+def get_next_match_date():
+    """Find the next date with actual football matches"""
+    uk_tz = pytz.timezone('Europe/London')
+    today = datetime.now(uk_tz)
+    
+    # Check next 7 days for matches
+    for days_ahead in range(0, 7):
+        check_date = today + timedelta(days=days_ahead)
+        formatted_date = check_date.strftime("%Y-%m-%d")
+        
+        # Quick check if any top leagues have matches on this date
+        for league_id in TOP_LEAGUES.values():
+            url = f"https://api.football-data.org/v4/matches?date={formatted_date}&competitions={league_id}"
+            try:
+                response = requests.get(url, headers=FOOTBALL_DATA_HEADERS, timeout=10)
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get('matches') and len(data['matches']) > 0:
+                        debug_log(f"Found matches on {formatted_date}")
+                        return formatted_date
+            except:
+                continue
+                
+        time.sleep(2)  # Rate limiting
+    
+    # If no matches found in next 7 days, return today's date
+    return today.strftime("%Y-%m-%d")
+
 def main():
     # Get current UK time
     uk_tz = pytz.timezone('Europe/London')
     now_uk = datetime.now(uk_tz)
-    today = now_uk.strftime("%Y-%m-%d")
     
-    debug_log(f"======== STARTING SCAN FOR {today} ========")
+    # Find the next date with actual matches
+    match_date = get_next_match_date()
+    
+    debug_log(f"======== STARTING SCAN FOR {match_date} ========")
     debug_log(f"Current UK time: {now_uk.strftime('%Y-%m-%d %H:%M:%S %Z')}")
     
-    fixtures = get_fixtures(today)
+    fixtures = get_fixtures(match_date)
     
     if not fixtures:
         debug_log("No fixtures found, sending Telegram alert")
-        send_telegram("⛔ <b>No Top League Fixtures Found Today</b>\n\nNo matches scheduled in top leagues for analysis.")
+        send_telegram("⛔ <b>No Top League Fixtures Found</b>\n\nNo matches scheduled in top leagues for the next week.")
         return
     
     debug_log(f"Processing {len(fixtures)} top league fixtures for predictions")
@@ -238,10 +273,12 @@ def main():
         try:
             predictions = analyze_fixture(fixture)
             if predictions:
+                match_time = datetime.fromisoformat(fixture['date'].replace('Z', '+00:00')).astimezone(uk_tz)
                 match_info = (
                     f"<b>🏟 {fixture['home']} vs {fixture['away']}</b>\n"
                     f"<b>League:</b> {fixture['league']}\n"
-                    f"<b>Time:</b> {datetime.fromisoformat(fixture['date'].replace('Z', '+00:00')).astimezone(uk_tz).strftime('%H:%M %Z')}\n"
+                    f"<b>Date:</b> {match_time.strftime('%Y-%m-%d')}\n"
+                    f"<b>Time:</b> {match_time.strftime('%H:%M %Z')}\n"
                     f"<b>Predictions:</b>\n" + "\n".join([f"• {pred}" for pred in predictions])
                 )
                 signals.append(match_info)
@@ -255,8 +292,8 @@ def main():
     if signals:
         message = (
             "⚽ <b>TOP LEAGUE PREDICTION SIGNALS</b> ⚽\n"
-            f"<b>Date:</b> {today}\n"
-            f"<b>Generated:</b> {now_uk.strftime('%H:%M %Z')}\n"
+            f"<b>Match Date:</b> {match_date}\n"
+            f"<b>Report Generated:</b> {now_uk.strftime('%Y-%m-%d %H:%M %Z')}\n"
             f"<b>Total Signals:</b> {len(signals)}/{len(fixtures)}\n\n"
             + "\n\n".join(signals) +
             "\n\n<i>Disclaimer: Predictions based on historical data analysis. Past performance doesn't guarantee future results.</i>"
@@ -266,10 +303,10 @@ def main():
     else:
         send_telegram(
             f"ℹ️ <b>No Prediction Signals Found</b>\n\n"
-            f"<b>Date:</b> {today}\n"
+            f"<b>Match Date:</b> {match_date}\n"
             f"<b>Scanned:</b> {len(fixtures)} top league fixtures\n"
             f"<b>Time:</b> {now_uk.strftime('%H:%M %Z')}\n\n"
-            "No top league matches met the prediction criteria today."
+            "No top league matches met the prediction criteria."
         )
         debug_log("No signals found")
     
