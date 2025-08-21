@@ -4,6 +4,7 @@ import time
 from datetime import datetime, timedelta
 import warnings
 import pytz
+import threading
 
 # Suppress SSL warnings
 warnings.filterwarnings('ignore', message='Unverified HTTPS request')
@@ -14,16 +15,15 @@ FOOTBALL_DATA_TOKEN = os.environ.get("FOOTBALL_DATA_TOKEN")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# Top league competitions (Football-Data.org IDs)
+# Top league competitions (Football-Data.org IDs) - Focus on top 7 leagues
 TOP_LEAGUES = {
-    "PL": 2021,     # Premier League
-    "LaLiga": 2014, # La Liga
-    "Bundesliga": 2002,  # Bundesliga
-    "Serie A": 2019,     # Serie A
-    "Ligue 1": 2015,     # Ligue 1
-    "UCL": 2001,         # Champions League
-    "UEL": 2000,         # Europa League
-    "MLS": 2142          # MLS (example secondary league)
+    "PL": 2021,        # Premier League
+    "LaLiga": 2014,    # La Liga
+    "Bundesliga": 2002, # Bundesliga
+    "Serie A": 2019,    # Serie A
+    "Ligue 1": 2015,    # Ligue 1
+    "UCL": 2001,        # Champions League
+    "UEL": 2000         # Europa League
 }
 
 HEADERS = {
@@ -32,6 +32,21 @@ HEADERS = {
 }
 
 FOOTBALL_DATA_HEADERS = {"X-Auth-Token": FOOTBALL_DATA_TOKEN}
+
+# Rate limiting variables
+last_request_time = 0
+request_lock = threading.Lock()
+MIN_REQUEST_INTERVAL = 9  # seconds (to stay under 10 requests/minute)
+
+def rate_limited_request():
+    """Ensure we don't exceed API rate limits"""
+    global last_request_time
+    with request_lock:
+        current_time = time.time()
+        elapsed = current_time - last_request_time
+        if elapsed < MIN_REQUEST_INTERVAL:
+            time.sleep(MIN_REQUEST_INTERVAL - elapsed)
+        last_request_time = time.time()
 
 def debug_log(message):
     timestamp = datetime.now(pytz.timezone('Europe/London')).strftime("%Y-%m-%d %H:%M:%S %Z")
@@ -49,7 +64,7 @@ def send_telegram(message):
         return None
 
 def get_fixtures(date):
-    """Get today's fixtures from football-data.org for TOP leagues only"""
+    """Get fixtures from football-data.org for TOP leagues only with rate limiting"""
     all_fixtures = []
     
     # Check each top league separately to avoid missing data
@@ -58,6 +73,7 @@ def get_fixtures(date):
         debug_log(f"FootballData REQ: {url}")
         
         try:
+            rate_limited_request()  # Rate limiting
             response = requests.get(url, headers=FOOTBALL_DATA_HEADERS, timeout=15)
             debug_log(f"FootballData RESP: {response.status_code}")
             
@@ -83,40 +99,41 @@ def get_fixtures(date):
                         debug_log(f"Added {league_name} fixture: {fixture_data['home']} vs {fixture_data['away']}")
                     except KeyError as e:
                         debug_log(f"Skipping fixture due to missing data: {str(e)}")
+            elif response.status_code == 429:
+                retry_after = int(response.headers.get('Retry-After', 10))
+                debug_log(f"Rate limited. Waiting {retry_after} seconds")
+                time.sleep(retry_after)
+                continue  # Retry this league
             elif response.status_code == 403:
-                debug_log("API rate limit exceeded or access denied")
+                debug_log("API access denied - check token validity")
                 break
-            elif response.status_code == 404:
-                debug_log(f"No data available for {league_name} on {date}")
             else:
-                debug_log(f"FootballData Error for {league_name}: {response.text[:200]}")
-            
-            # Respect API rate limits (10 requests per minute)
-            time.sleep(10)  # 6 seconds between league requests
+                debug_log(f"FootballData Error for {league_name}: {response.status_code}")
             
         except Exception as e:
             debug_log(f"FootballData Exception for {league_name}: {str(e)}")
     
-    # Sort by league importance and limit to 20 fixtures max
-    priority_leagues = [2021, 2014, 2002, 2019, 2015, 2001, 2000]  # Priority order
+    # Sort by league importance and limit to 15 fixtures max
+    priority_leagues = [2021, 2014, 2002, 2019, 2015, 2001, 2000]
     all_fixtures.sort(key=lambda x: priority_leagues.index(x['competition_id']) 
                       if x['competition_id'] in priority_leagues else 999)
     
     debug_log(f"Total top league fixtures found: {len(all_fixtures)}")
-    return all_fixtures[:20]  # Limit to 20 most important fixtures
+    return all_fixtures[:15]  # Limit to 15 most important fixtures
 
 def get_team_history(team_id, is_home, opponent_id=None):
-    """Get team form with flexible data source"""
+    """Get team form with flexible data source and rate limiting"""
     # First try football-data.org
     url = f"https://api.football-data.org/v4/teams/{team_id}/matches"
     params = {
         "status": "FINISHED",
-        "limit": 10,
-        "dateFrom": (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d"),
+        "limit": 8,  # Reduced from 10 to save requests
+        "dateFrom": (datetime.now() - timedelta(days=120)).strftime("%Y-%m-%d"),  # 4 months instead of 6
         "dateTo": (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
     }
     
     try:
+        rate_limited_request()  # Rate limiting
         response = requests.get(url, headers=FOOTBALL_DATA_HEADERS, params=params, timeout=10)
         if response.status_code == 200:
             data = response.json()
@@ -137,6 +154,9 @@ def get_team_history(team_id, is_home, opponent_id=None):
                 return h2h_matches[:5]  # Return last 5 H2H
             
             return venue_matches[:5]  # Return last 5 venue-specific matches
+        elif response.status_code == 429:
+            debug_log("Rate limited in team history request")
+            return []
     except:
         pass
     
@@ -147,6 +167,7 @@ def get_team_history(team_id, is_home, opponent_id=None):
     params = {"team": team_id, "last": 5, "status": "finished", "venue": venue}
     
     try:
+        rate_limited_request()  # Rate limiting for RapidAPI too
         response = requests.get(url, headers=HEADERS, params=params, verify=False, timeout=8)
         if response.status_code == 200:
             data = response.json()
@@ -219,92 +240,121 @@ def analyze_fixture(fixture):
     
     return predictions
 
-def get_next_match_date():
-    """Find the next date with actual football matches"""
+def get_upcoming_match_dates(days=7):
+    """Get a list of dates with matches in the next X days"""
     uk_tz = pytz.timezone('Europe/London')
     today = datetime.now(uk_tz)
+    match_dates = []
     
-    # Check next 7 days for matches
-    for days_ahead in range(0, 7):
-        check_date = today + timedelta(days=days_ahead)
+    for i in range(days):
+        check_date = today + timedelta(days=i)
         formatted_date = check_date.strftime("%Y-%m-%d")
         
         # Quick check if any top leagues have matches on this date
         for league_id in TOP_LEAGUES.values():
             url = f"https://api.football-data.org/v4/matches?date={formatted_date}&competitions={league_id}"
             try:
+                rate_limited_request()
                 response = requests.get(url, headers=FOOTBALL_DATA_HEADERS, timeout=10)
                 if response.status_code == 200:
                     data = response.json()
                     if data.get('matches') and len(data['matches']) > 0:
+                        match_dates.append(formatted_date)
                         debug_log(f"Found matches on {formatted_date}")
-                        return formatted_date
+                        break
+                elif response.status_code == 429:
+                    debug_log("Rate limited during date checking")
+                    time.sleep(10)
             except:
                 continue
                 
-        time.sleep(2)  # Rate limiting
+        time.sleep(1)  # Small delay between date checks
     
-    # If no matches found in next 7 days, return today's date
-    return today.strftime("%Y-%m-%d")
+    return match_dates if match_dates else [today.strftime("%Y-%m-%d")]
 
 def main():
     # Get current UK time
     uk_tz = pytz.timezone('Europe/London')
     now_uk = datetime.now(uk_tz)
     
-    # Find the next date with actual matches
-    match_date = get_next_match_date()
+    # Get upcoming match dates (next 7 days)
+    match_dates = get_upcoming_match_dates(7)
+    debug_log(f"Found matches on these dates: {match_dates}")
     
-    debug_log(f"======== STARTING SCAN FOR {match_date} ========")
-    debug_log(f"Current UK time: {now_uk.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    all_signals = []
     
-    fixtures = get_fixtures(match_date)
+    for match_date in match_dates:
+        debug_log(f"======== SCANNING DATE: {match_date} ========")
+        
+        fixtures = get_fixtures(match_date)
+        
+        if not fixtures:
+            debug_log(f"No fixtures found for {match_date}")
+            continue
+        
+        debug_log(f"Processing {len(fixtures)} top league fixtures for {match_date}")
+        signals = []
+        
+        for i, fixture in enumerate(fixtures):
+            debug_log(f"Analyzing {i+1}/{len(fixtures)}: {fixture['home']} vs {fixture['away']}")
+            try:
+                predictions = analyze_fixture(fixture)
+                if predictions:
+                    match_time = datetime.fromisoformat(fixture['date'].replace('Z', '+00:00')).astimezone(uk_tz)
+                    match_info = (
+                        f"<b>🏟 {fixture['home']} vs {fixture['away']}</b>\n"
+                        f"<b>League:</b> {fixture['league']}\n"
+                        f"<b>Date:</b> {match_time.strftime('%Y-%m-%d')}\n"
+                        f"<b>Time:</b> {match_time.strftime('%H:%M %Z')}\n"
+                        f"<b>Predictions:</b>\n" + "\n".join([f"• {pred}" for pred in predictions])
+                    )
+                    signals.append(match_info)
+                    debug_log(f"Signal found: {predictions}")
+                else:
+                    debug_log("No predictions met criteria")
+            except Exception as e:
+                debug_log(f"Analysis error: {str(e)}")
+            time.sleep(1.5)  # Rate limiting between fixtures
+        
+        if signals:
+            all_signals.append({
+                "date": match_date,
+                "signals": signals,
+                "count": len(signals),
+                "total_fixtures": len(fixtures)
+            })
     
-    if not fixtures:
-        debug_log("No fixtures found, sending Telegram alert")
-        send_telegram("⛔ <b>No Top League Fixtures Found</b>\n\nNo matches scheduled in top leagues for the next week.")
-        return
-    
-    debug_log(f"Processing {len(fixtures)} top league fixtures for predictions")
-    signals = []
-    
-    for i, fixture in enumerate(fixtures):
-        debug_log(f"Analyzing {i+1}/{len(fixtures)}: {fixture['home']} vs {fixture['away']}")
-        try:
-            predictions = analyze_fixture(fixture)
-            if predictions:
-                match_time = datetime.fromisoformat(fixture['date'].replace('Z', '+00:00')).astimezone(uk_tz)
-                match_info = (
-                    f"<b>🏟 {fixture['home']} vs {fixture['away']}</b>\n"
-                    f"<b>League:</b> {fixture['league']}\n"
-                    f"<b>Date:</b> {match_time.strftime('%Y-%m-%d')}\n"
-                    f"<b>Time:</b> {match_time.strftime('%H:%M %Z')}\n"
-                    f"<b>Predictions:</b>\n" + "\n".join([f"• {pred}" for pred in predictions])
-                )
-                signals.append(match_info)
-                debug_log(f"Signal found: {predictions}")
-            else:
-                debug_log("No predictions met criteria")
-        except Exception as e:
-            debug_log(f"Analysis error: {str(e)}")
-        time.sleep(1.5)  # Rate limiting
-    
-    if signals:
-        message = (
-            "⚽ <b>TOP LEAGUE PREDICTION SIGNALS</b> ⚽\n"
-            f"<b>Match Date:</b> {match_date}\n"
+    # Send consolidated report
+    if all_signals:
+        message = "⚽ <b>TOP LEAGUE PREDICTION SIGNALS</b> ⚽\n\n"
+        
+        for date_data in all_signals:
+            message += (
+                f"<b>📅 Date: {date_data['date']}</b>\n"
+                f"<b>Signals: {date_data['count']}/{date_data['total_fixtures']}</b>\n\n"
+                + "\n\n".join(date_data['signals']) + "\n\n"
+            )
+        
+        message += (
             f"<b>Report Generated:</b> {now_uk.strftime('%Y-%m-%d %H:%M %Z')}\n"
-            f"<b>Total Signals:</b> {len(signals)}/{len(fixtures)}\n\n"
-            + "\n\n".join(signals) +
-            "\n\n<i>Disclaimer: Predictions based on historical data analysis. Past performance doesn't guarantee future results.</i>"
+            f"<b>Total Signals:</b> {sum(d['count'] for d in all_signals)}\n\n"
+            "<i>Disclaimer: Predictions based on historical data analysis. Past performance doesn't guarantee future results.</i>"
         )
-        send_telegram(message)
-        debug_log(f"Sent {len(signals)} signals to Telegram")
+        
+        # Split message if too long for Telegram (max 4096 characters)
+        if len(message) > 4000:
+            parts = [message[i:i+4000] for i in range(0, len(message), 4000)]
+            for part in parts:
+                send_telegram(part)
+                time.sleep(1)
+        else:
+            send_telegram(message)
+            
+        debug_log(f"Sent {sum(d['count'] for d in all_signals)} signals to Telegram")
     else:
         send_telegram(
             f"ℹ️ <b>No Prediction Signals Found</b>\n\n"
-            f"<b>Match Date:</b> {match_date}\n"
-            f"<b>Scanned:</b> {len(fixtures)} top league fixtures\n"
+            f"<b>Dates Checked:</b> {', '.join(match_dates)}\n"
             f"<b>Time:</b> {now_uk.strftime('%H:%M %Z')}\n\n"
             "No top league matches met the prediction criteria."
         )
