@@ -1,441 +1,279 @@
 import os
 import requests
-import pandas as pd
-import pandas_ta as ta
-import numpy as np
-import time as t
-from datetime import datetime, time, timedelta
+import time
+from datetime import datetime, timedelta
+import warnings
 import pytz
-from statsmodels.tsa.stattools import coint
-from sklearn.linear_model import LinearRegression
-import calendar
 
-# ===== Consolidated API Configuration =====
-TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
-TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
-API_KEY = os.environ.get('TWELVEDATA_API_KEY', '')
+# Suppress SSL warnings
+warnings.filterwarnings('ignore', message='Unverified HTTPS request')
 
-# API rate management
-API_CALL_COUNTER = 0
-API_CALL_DELAY = 8  # Seconds between API calls
-LAST_RESET_MONTH = datetime.utcnow().month
+# Configuration from environment variables
+RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY")
+FOOTBALL_DATA_TOKEN = os.environ.get("FOOTBALL_DATA_TOKEN")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-def reset_api_counter_if_needed():
-    global API_CALL_COUNTER, LAST_RESET_MONTH
-    current_month = datetime.utcnow().month
-    if current_month != LAST_RESET_MONTH:
-        API_CALL_COUNTER = 0
-        LAST_RESET_MONTH = current_month
-        print(f"API counter reset for new month: {calendar.month_name[current_month]}")
+# Top league competitions (Football-Data.org IDs)
+TOP_LEAGUES = {
+    "PL": 2021,     # Premier League
+    "LaLiga": 2014, # La Liga
+    "Bundesliga": 2002,  # Bundesliga
+    "Serie A": 2019,     # Serie A
+    "Ligue 1": 2015,     # Ligue 1
+    "UCL": 2001,         # Champions League
+    "UEL": 2000,         # Europa League
+    "MLS": 2142          MLS (example secondary league)
+}
 
-BASE_URL = "https://api.twelvedata.com"
-REALTIME_ENDPOINT = f"{BASE_URL}/price"
-OHLC_ENDPOINT = f"{BASE_URL}/time_series"
+HEADERS = {
+    "X-RapidAPI-Key": RAPIDAPI_KEY,
+    "X-RapidAPI-Host": "api-football-v1.p.rapidapi.com"
+}
 
-class EnhancedScanner:
-    def __init__(self):
-        self.uk_tz = pytz.timezone('Europe/London')
-        self.scan_time = datetime.now(self.uk_tz).strftime("%Y-%m-%d %H:%M")
-        self.signals = []
-        
-        # Define strategies with their parameters
-        self.strategies = [
-            {
-                'name': 'Asian Range Breakout',
-                'pairs': ['AUD/USD', 'NZD/USD', 'USD/JPY'],
-                'timeframe': '15min',
-                'active_window': (time(0, 30), time(6, 0)), 
-                'active_days': [0, 1, 2, 3, 4],  # Monday(0) to Friday(4)
-                'function': self.asian_range_breakout_strategy
-            },
-            {
-                'name': 'Gold CMAR Strategy',
-                'pairs': ['XAU/USD'],
-                'timeframe': '1h',
-                'active_window': (time(9, 0), time(16, 0)),  # 9am-4pm UK time (7 hours)
-                'active_days': [0, 1, 2, 3, 4],  # Monday to Friday
-                'function': self.gold_strategy
-            }
-        ]
-        
-    def get_uk_time(self):
-        return datetime.now(self.uk_tz)
-    
-    def is_strategy_active(self, strategy):
-        now = self.get_uk_time()
-        current_time = now.time()
-        current_day = now.weekday()  # Monday=0, Sunday=6
-        
-        # Check trading days
-        if strategy['active_days'] is not None and current_day not in strategy['active_days']:
-            return False
-            
-        # Check trading hours
-        start, end = strategy['active_window']
-        return start <= current_time < end
-    
-    def api_call(self, endpoint, params=None):
-        """Make API call with rate limit management"""
-        global API_CALL_COUNTER
-        reset_api_counter_if_needed()
-        
-        # Add API key to parameters
-        params = params or {}
-        params["apikey"] = API_KEY
-        
-        try:
-            # Respect API call delay
-            t.sleep(API_CALL_DELAY)
-            
-            response = requests.get(endpoint, params=params, timeout=15)
-            response.raise_for_status()
-            API_CALL_COUNTER += 1
-            return response.json()
-        except Exception as e:
-            print(f"API Error: {str(e)}")
-            return None
-    
-    def get_current_price(self, pair):
-        """Get current price using TwelveData API"""
-        params = {"symbol": pair}
-        data = self.api_call(REALTIME_ENDPOINT, params)
-        if data and 'price' in data:
-            try:
-                return float(data['price'])
-            except:
-                pass
+FOOTBALL_DATA_HEADERS = {"X-Auth-Token": FOOTBALL_DATA_TOKEN}
+
+def debug_log(message):
+    timestamp = datetime.now(pytz.timezone('Europe/London')).strftime("%Y-%m-%d %H:%M:%S %Z")
+    print(f"[DEBUG][{timestamp}] {message}")
+
+def send_telegram(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
+    try:
+        response = requests.post(url, json=payload, verify=False, timeout=10)
+        debug_log(f"Telegram response: {response.status_code}")
+        return response.json()
+    except Exception as e:
+        debug_log(f"Telegram send error: {str(e)[:100]}")
         return None
-    
-    def fetch_ohlc_data(self, pair, timeframe):
-        """Fetch OHLC data using TwelveData API"""
-        params = {
-            "symbol": pair,
-            "interval": timeframe,
-            "outputsize": 100,
-            "timezone": "Europe/London"
-        }
-        data = self.api_call(OHLC_ENDPOINT, params)
-        
-        if not data or 'values' not in data:
-            return None
-            
-        df = pd.DataFrame(data['values'])
-        df = df.iloc[::-1].reset_index(drop=True)
-        
-        # Process numeric columns
-        for col in ['open', 'high', 'low', 'close']:
-            if col in df: 
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-        
-        # Process datetime
-        if 'datetime' in df:
-            df['datetime'] = pd.to_datetime(df['datetime'])
-            df['datetime'] = df['datetime'].dt.tz_localize('UTC').dt.tz_convert('Europe/London')
-            df['hour'] = df['datetime'].dt.hour
-            df['time'] = df['datetime'].dt.time
-        else:
-            now = datetime.now(self.uk_tz)
-            df['datetime'] = pd.date_range(end=now, periods=len(df), freq=timeframe)
-            df['hour'] = df['datetime'].dt.hour
-            df['time'] = df['datetime'].dt.time
-        
-        # Calculate technical indicators
-        df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
-        
-        # Additional processing for Gold strategy
-        if pair == 'XAU/USD':
-            df["S_3"] = df["close"].rolling(3).mean()
-            df["S_9"] = df["close"].rolling(9).mean()
-            
-            # Cointegration check
-            try:
-                _, pvalue_3, _ = coint(df["S_3"], df["close"])
-                _, pvalue_9, _ = coint(df["S_9"], df["close"])
-                df["cointegrated"] = (pvalue_3 < 0.05) & (pvalue_9 < 0.05)
-            except:
-                df["cointegrated"] = False
-        
-        return df.dropna()
-    
-    # ===== Strategy Implementations =====
-    def asian_range_breakout_strategy(self, df, current_price):
-        """Asian Range Breakout for Forex pairs (00:30-06:00 UK)"""
-        if df is None or len(df) < 20: 
-            return None
-        
-        try:
-            # Filter Asian session (00:30-06:00 UK)
-            start_time = time(0, 30)
-            end_time = time(6, 0)
-            asian_session = df[(df['time'] >= start_time) & (df['time'] < end_time)]
-            
-            if len(asian_session) < 4: 
-                return None
-            
-            session_high = asian_session['high'].max()
-            session_low = asian_session['low'].min()
-            session_open = asian_session.iloc[0]['open']
-            latest = df.iloc[-1]
-            
-            # Calculate buffer (30% of ATR)
-            buffer = latest['atr'] * 0.3 if 'atr' in df and pd.notnull(latest['atr']) else 0.001
-            
-            # Bullish Breakout
-            if (current_price > session_high + buffer and
-                current_price > session_open and
-                latest['close'] > latest['open']):
-                return {
-                    'direction': 'BUY', 
-                    'session_high': session_high, 
-                    'session_low': session_low,
-                    'pip_value': 10000  # For Forex pairs
-                }
-            
-            # Bearish Breakout
-            elif (current_price < session_low - buffer and
-                  current_price < session_open and
-                  latest['close'] < latest['open']):
-                return {
-                    'direction': 'SELL', 
-                    'session_high': session_high, 
-                    'session_low': session_low,
-                    'pip_value': 10000
-                }
-            
-            return None
-        except Exception as e:
-            print(f"Asian breakout error: {str(e)}")
-            return None
-    
-    def gold_strategy(self, df, current_price):
-        """Gold CMAR Strategy for XAU/USD"""
-        if df is None or len(df) < 50: 
-            return None
-        
-        try:
-            # Only use cointegrated periods
-            if not df.iloc[-1].get('cointegrated', False):
-                return None
-                
-            # Prepare features
-            features = pd.DataFrame({
-                "S_3": [df.iloc[-1]['S_3']],
-                "S_9": [df.iloc[-1]['S_9']]
-            })
-            
-            # Train model - FIXED: Ensure equal sample sizes
-            train_df = df[df["cointegrated"]].copy()
-            if len(train_df) < 50:
-                return None
-                
-            # Create target (next period's close)
-            train_df['target'] = train_df['close'].shift(-1)
-            train_df = train_df.dropna(subset=['target'])
-            
-            if len(train_df) < 2:
-                return None
-                
-            model = LinearRegression()
-            model.fit(train_df[["S_3", "S_9"]], train_df['target'])
-            
-            # Predict next close
-            pred = model.predict(features)[0]
-            
-            # Generate signal (20 pip target)
-            pip_value = 10  # For Gold (XAU/USD)
-            pip_threshold = 20 / pip_value
-            
-            if pred > current_price + pip_threshold:
-                return {
-                    'direction': 'BUY', 
-                    'predicted_price': pred,
-                    'pip_value': pip_value
-                }
-            elif pred < current_price - pip_threshold:
-                return {
-                    'direction': 'SELL', 
-                    'predicted_price': pred,
-                    'pip_value': pip_value
-                }
-            
-            return None
-        except Exception as e:
-            print(f"Gold strategy error: {str(e)}")
-            return None
-    
-    # ===== Target Calculation & Telegram =====
-    def calculate_targets(self, signal, current_price):
-        pip_value = signal.get('pip_value', 10000)  # Default to Forex pip value
-        direction = signal['direction']
-        
-        # Base targets
-        base_tp = 20 / pip_value
-        base_sl = 15 / pip_value
-        
-        # Volatility adjustment
-        if 'atr' in signal:
-            volatility = signal['atr'] * pip_value
-            if volatility > 15:  # High volatility
-                base_tp = 25 / pip_value
-            elif volatility < 8:  # Low volatility
-                base_tp = 15 / pip_value
-        
-        if direction == 'BUY':
-            tp = current_price + base_tp
-            sl = current_price - base_sl
-        else:  # SELL
-            tp = current_price - base_tp
-            sl = current_price + base_sl
-            
-        return tp, sl, base_tp * pip_value
-    
-    def send_telegram_message(self, message):
-        try:
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={
-                    'chat_id': TELEGRAM_CHAT_ID,
-                    'text': message,
-                    'parse_mode': 'Markdown'
-                },
-                timeout=10
-            )
-            return True
-        except:
-            return False
-    
-    def scan(self):
-        # ===== GLOBAL TIME CHECK =====
-        now = self.get_uk_time()
-        current_day = now.weekday()  # Monday=0, Sunday=6
-        current_hour = now.hour
-        
-        # Skip weekends (Saturday=5, Sunday=6)
-        if current_day >= 5:
-            print("Skipping scan: Weekend")
-            return
-            
-        # Skip Friday after 18:00 UK time
-        if current_day == 4 and current_hour > 18:  # Friday=4
-            print("Skipping scan: Friday after 18:00")
-            return
-        # =============================
-            
-        print(f"\n🔍 Starting Enhanced Scanner at {self.scan_time}")
-        print(f"API calls this month: {API_CALL_COUNTER}")
-        scan_results = []
-        signal_count = 0
-        
-        for strategy in self.strategies:
-            strategy_name = strategy['name']
-            print(f"\n=== Scanning {strategy_name} ===")
-            
-            if not self.is_strategy_active(strategy):
-                print(f"  Strategy not active at this time")
-                continue
-                
-            for pair in strategy['pairs']:
-                print(f"\nScanning {pair}...")
-                pair_status = f"{strategy_name} - {pair}: "
-                
-                # Get current price
-                current_price = self.get_current_price(pair)
-                if current_price is None:
-                    pair_status += "❌ Price fetch failed"
-                    scan_results.append(pair_status)
-                    print(pair_status)
-                    continue
-                else:
-                    print(f"  Current price: {current_price:.5f}")
-                
-                # Get OHLC data
-                df = self.fetch_ohlc_data(pair, strategy['timeframe'])
-                if df is None or len(df) < 20:
-                    pair_status += "❌ Data fetch failed"
-                    scan_results.append(pair_status)
-                    print(pair_status)
-                    continue
-                
-                # Run strategy
-                signal = strategy['function'](df, current_price)
-                
-                if signal:
-                    # Calculate targets
-                    tp, sl, pips = self.calculate_targets(signal, current_price)
-                    
-                    # Prepare signal details
-                    signal_details = {
-                        'entry': current_price,
-                        'tp': tp,
-                        'sl': sl,
-                        'pips': pips,
-                        'strategy': strategy_name,
-                        'pair': pair
-                    }
-                    
-                    # Merge signal details
-                    full_signal = {**signal, **signal_details}
-                    self.signals.append(full_signal)
-                    
-                    # Format signal message
-                    direction_icon = "🟢 BUY" if signal['direction'] == 'BUY' else "🔴 SELL"
-                    
-                    if strategy_name == 'Gold CMAR Strategy':
-                        details = (
-                            f"📈 Predicted Price: `{full_signal['predicted_price']:.2f}`\n"
-                            f"📊 Current Price: `{current_price:.2f}`"
-                        )
-                    else:
-                        details = (
-                            f"📈 Session High: `{full_signal['session_high']:.5f}`\n"
-                            f"📉 Session Low: `{full_signal['session_low']:.5f}`"
-                        )
-                    
-                    detailed_msg = (
-                        f"🚀 *{strategy_name} SIGNAL* {direction_icon}\n"
-                        f"⏰ {self.scan_time} UK\n"
-                        f"📊 *{pair}* | {direction_icon}\n"
-                        f"📍 Entry: `{current_price:.5f}`\n"
-                        f"🎯 TP: `{tp:.5f}` | *{pips:.0f} pips*\n"
-                        f"🛑 SL: `{sl:.5f}`\n"
-                        f"{details}"
-                    )
-                    
-                    if self.send_telegram_message(detailed_msg):
-                        pair_status += f"✅ Signal sent"
-                    else:
-                        pair_status += f"⚠️ Signal (Telegram failed)"
-                    
-                    signal_count += 1
-                    print(f"  Signal found! {signal['direction']}")
-                else:
-                    pair_status += "⚪ No signal"
-                    print(f"  No signal")
-                
-                scan_results.append(pair_status)
-        
-        # Prepare and send summary message
-        summary_title = f"✅ {signal_count} SIGNAL{'S' if signal_count != 1 else ''} FOUND" if signal_count else "⚠️ NO SIGNALS"
-        
-        summary_msg = (
-            f"📊 *SCAN SUMMARY*\n"
-            f"{summary_title} | {self.scan_time} UK\n"
-            f"Total Strategies: {len(self.strategies)}\n\n"
-            f"Scan Results:\n" + "\n".join(scan_results)
-        )
-        
-        self.send_telegram_message(summary_msg)
-        print(f"\nScan complete! {summary_title}")
 
-# ===== Run Scanner =====
+def get_fixtures(date):
+    """Get today's fixtures from football-data.org for TOP leagues only"""
+    all_fixtures = []
+    
+    # Check each top league separately to avoid missing data
+    for league_name, league_id in TOP_LEAGUES.items():
+        url = f"https://api.football-data.org/v4/matches?date={date}&competitions={league_id}"
+        debug_log(f"FootballData REQ: {url}")
+        
+        try:
+            response = requests.get(url, headers=FOOTBALL_DATA_HEADERS, timeout=15)
+            debug_log(f"FootballData RESP: {response.status_code}")
+            
+            if response.status_code == 200:
+                data = response.json()
+                matches = data.get('matches', [])
+                debug_log(f"Found {len(matches)} fixtures in {league_name}")
+                
+                for fixture in matches:
+                    try:
+                        # Extract fixture data
+                        fixture_data = {
+                            "id": fixture['id'],
+                            "league": fixture['competition']['name'],
+                            "home": fixture['homeTeam']['name'],
+                            "away": fixture['awayTeam']['name'],
+                            "home_id": fixture['homeTeam']['id'],
+                            "away_id": fixture['awayTeam']['id'],
+                            "date": fixture['utcDate'],
+                            "competition_id": fixture['competition']['id']
+                        }
+                        all_fixtures.append(fixture_data)
+                        debug_log(f"Added {league_name} fixture: {fixture_data['home']} vs {fixture_data['away']}")
+                    except KeyError as e:
+                        debug_log(f"Skipping fixture due to missing data: {str(e)}")
+            else:
+                debug_log(f"FootballData Error for {league_name}: {response.text[:200]}")
+            
+            # Respect API rate limits (10 requests per minute)
+            time.sleep(6)  # 6 seconds between league requests
+            
+        except Exception as e:
+            debug_log(f"FootballData Exception for {league_name}: {str(e)}")
+    
+    # Sort by league importance and limit to 20 fixtures max
+    priority_leagues = [2021, 2014, 2002, 2019, 2015, 2001, 2000]  # Priority order
+    all_fixtures.sort(key=lambda x: priority_leagues.index(x['competition_id']) 
+                      if x['competition_id'] in priority_leagues else 999)
+    
+    debug_log(f"Total top league fixtures found: {len(all_fixtures)}")
+    return all_fixtures[:20]  # Limit to 20 most important fixtures
+
+def get_team_history(team_id, is_home, opponent_id=None):
+    """Get team form with flexible data source"""
+    # First try football-data.org
+    url = f"https://api.football-data.org/v4/teams/{team_id}/matches"
+    params = {
+        "status": "FINISHED",
+        "limit": 10,
+        "dateFrom": (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d"),
+        "dateTo": (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    }
+    
+    try:
+        response = requests.get(url, headers=FOOTBALL_DATA_HEADERS, params=params, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            matches = data.get('matches', [])
+            
+            # Filter for home/away matches
+            venue_matches = []
+            for match in matches:
+                if is_home and match['homeTeam']['id'] == team_id:
+                    venue_matches.append(match)
+                elif not is_home and match['awayTeam']['id'] == team_id:
+                    venue_matches.append(match)
+            
+            # If we have opponent-specific request, filter H2H
+            if opponent_id:
+                h2h_matches = [m for m in venue_matches 
+                              if opponent_id in (m['homeTeam']['id'], m['awayTeam']['id'])]
+                return h2h_matches[:5]  # Return last 5 H2H
+            
+            return venue_matches[:5]  # Return last 5 venue-specific matches
+    except:
+        pass
+    
+    # Fallback to RapidAPI if football-data fails
+    debug_log(f"Using RapidAPI fallback for team {team_id}")
+    url = "https://api-football-v1.p.rapidapi.com/v3/fixtures"
+    venue = "home" if is_home else "away"
+    params = {"team": team_id, "last": 5, "status": "finished", "venue": venue}
+    
+    try:
+        response = requests.get(url, headers=HEADERS, params=params, verify=False, timeout=8)
+        if response.status_code == 200:
+            data = response.json()
+            return data.get('response', [])
+    except:
+        pass
+    
+    return []
+
+def analyze_fixture(fixture):
+    """Improved prediction logic with flexible thresholds"""
+    predictions = []
+    
+    # Get required data with football-data first
+    h2h_matches = get_team_history(fixture['home_id'], True, fixture['away_id'])
+    home_form = get_team_history(fixture['home_id'], True)
+    away_form = get_team_history(fixture['away_id'], False)
+    
+    debug_log(f"Found: {len(h2h_matches)} H2H, {len(home_form)} home form, {len(away_form)} away form")
+    
+    # Rule 1: H2H Dominance (W1/W2) - require at least 3 matches
+    if len(h2h_matches) >= 3:
+        home_wins = 0
+        away_wins = 0
+        
+        for match in h2h_matches:
+            if match['homeTeam']['id'] == fixture['home_id']:
+                if match['score']['fullTime']['home'] > match['score']['fullTime']['away']:
+                    home_wins += 1
+                elif match['score']['fullTime']['home'] < match['score']['fullTime']['away']:
+                    away_wins += 1
+        
+        if home_wins >= 3:
+            predictions.append(f"W1 (H2H: {home_wins}/{len(h2h_matches)} wins)")
+        elif away_wins >= 3:
+            predictions.append(f"W2 (H2H: {away_wins}/{len(h2h_matches)} wins)")
+    
+    # Rule 2: Home/Away Form (W1/W2) - require at least 3 matches
+    if len(home_form) >= 3:
+        home_wins = sum(1 for m in home_form 
+                      if m['homeTeam']['id'] == fixture['home_id'] and 
+                         m['score']['fullTime']['home'] > m['score']['fullTime']['away'])
+        
+        if home_wins >= 3:
+            predictions.append(f"W1 (Home Form: {home_wins}/{len(home_form)} wins)")
+    
+    if len(away_form) >= 3:
+        away_wins = sum(1 for m in away_form 
+                      if m['awayTeam']['id'] == fixture['away_id'] and 
+                         m['score']['fullTime']['away'] > m['score']['fullTime']['home'])
+        
+        if away_wins >= 3:
+            predictions.append(f"W2 (Away Form: {away_wins}/{len(away_form)} wins)")
+    
+    # Rule 3: Both Teams to Score (BTS)
+    if len(h2h_matches) >= 3:
+        bts_count = sum(1 for m in h2h_matches 
+                      if m['score']['fullTime']['home'] > 0 and m['score']['fullTime']['away'] > 0)
+        
+        if bts_count >= 3:
+            predictions.append(f"BTS (H2H: {bts_count}/{len(h2h_matches)} matches)")
+    
+    # Rule 4: Over 2.5 Goals
+    if len(h2h_matches) >= 3:
+        over_count = sum(1 for m in h2h_matches 
+                       if m['score']['fullTime']['home'] + m['score']['fullTime']['away'] > 2.5)
+        
+        if over_count >= 3:
+            predictions.append(f"Over 2.5 (H2H: {over_count}/{len(h2h_matches)} matches)")
+    
+    return predictions
+
+def main():
+    # Get current UK time
+    uk_tz = pytz.timezone('Europe/London')
+    now_uk = datetime.now(uk_tz)
+    today = now_uk.strftime("%Y-%m-%d")
+    
+    debug_log(f"======== STARTING SCAN FOR {today} ========")
+    debug_log(f"Current UK time: {now_uk.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    
+    fixtures = get_fixtures(today)
+    
+    if not fixtures:
+        debug_log("No fixtures found, sending Telegram alert")
+        send_telegram("⛔ <b>No Top League Fixtures Found Today</b>\n\nNo matches scheduled in top leagues for analysis.")
+        return
+    
+    debug_log(f"Processing {len(fixtures)} top league fixtures for predictions")
+    signals = []
+    
+    for i, fixture in enumerate(fixtures):
+        debug_log(f"Analyzing {i+1}/{len(fixtures)}: {fixture['home']} vs {fixture['away']}")
+        try:
+            predictions = analyze_fixture(fixture)
+            if predictions:
+                match_info = (
+                    f"<b>🏟 {fixture['home']} vs {fixture['away']}</b>\n"
+                    f"<b>League:</b> {fixture['league']}\n"
+                    f"<b>Time:</b> {datetime.fromisoformat(fixture['date'].replace('Z', '+00:00')).astimezone(uk_tz).strftime('%H:%M %Z')}\n"
+                    f"<b>Predictions:</b>\n" + "\n".join([f"• {pred}" for pred in predictions])
+                )
+                signals.append(match_info)
+                debug_log(f"Signal found: {predictions}")
+            else:
+                debug_log("No predictions met criteria")
+        except Exception as e:
+            debug_log(f"Analysis error: {str(e)}")
+        time.sleep(1.5)  # Rate limiting
+    
+    if signals:
+        message = (
+            "⚽ <b>TOP LEAGUE PREDICTION SIGNALS</b> ⚽\n"
+            f"<b>Date:</b> {today}\n"
+            f"<b>Generated:</b> {now_uk.strftime('%H:%M %Z')}\n"
+            f"<b>Total Signals:</b> {len(signals)}/{len(fixtures)}\n\n"
+            + "\n\n".join(signals) +
+            "\n\n<i>Disclaimer: Predictions based on historical data analysis. Past performance doesn't guarantee future results.</i>"
+        )
+        send_telegram(message)
+        debug_log(f"Sent {len(signals)} signals to Telegram")
+    else:
+        send_telegram(
+            f"ℹ️ <b>No Prediction Signals Found</b>\n\n"
+            f"<b>Date:</b> {today}\n"
+            f"<b>Scanned:</b> {len(fixtures)} top league fixtures\n"
+            f"<b>Time:</b> {now_uk.strftime('%H:%M %Z')}\n\n"
+            "No top league matches met the prediction criteria today."
+        )
+        debug_log("No signals found")
+    
+    debug_log("======== SCAN COMPLETED ========")
+
 if __name__ == "__main__":
-    print("Starting Enhanced Scanner")
-    print("=" * 40)
-    print("Strategies:")
-    print("- Asian Range Breakout (00:30-06:00 UK, Mon-Fri, Forex pairs)")
-    print("- Gold CMAR Strategy (9am-4pm UK Mon-Fri, XAU/USD)\n")
-    
-    scanner = EnhancedScanner()
-    scanner.scan()
-    
-    print("\nScanner finished")
+    main()
