@@ -23,7 +23,7 @@ TOP_LEAGUES = {
     "Ligue 1": 2015,     # Ligue 1
     "UCL": 2001,         # Champions League
     "UEL": 2000,         # Europa League
-    "MLS": 2142          MLS (example secondary league)
+    "MLS": 2142          # MLS (example secondary league)
 }
 
 HEADERS = {
