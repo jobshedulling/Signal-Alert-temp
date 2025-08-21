@@ -1,38 +1,47 @@
-name: Forex Scanner Schedule
+name: Football Scanner
 
 on:
   schedule:
-    - cron: "0 0-18 * * 1-5"  # Every hour 00:00-18:00 UTC Mon-Fri
-  workflow_dispatch:
+    # Runs at 3 AM UK time every day (adjusts for BST/GMT automatically)
+    - cron: '0 3 * * *'
+  workflow_dispatch:  # Allow manual triggering
 
 jobs:
   run-scanner:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-
+    environment: production
+    
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v3
 
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
 
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install requests pandas numpy pytz statsmodels scikit-learn pandas_ta==0.3.14b0
-        sudo apt-get install -y libatlas-base-dev
-        
-        # Patch pandas_ta to fix NaN import error
-        find ${{ env.pythonLocation }} -name squeeze_pro.py -exec sed -i "s/from numpy import NaN as npNaN/from numpy import nan as npNaN/" {} \;
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-    - name: Run Enhanced Scanner
-      env:
-        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
-        GOLDAPI_KEY: ${{ secrets.GOLDAPI_KEY }}
-      run: |
-        python scanner.py
+      - name: Run scanner
+        env:
+          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
+          FOOTBALL_DATA_TOKEN: ${{ secrets.FOOTBALL_DATA_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python scanner.py
+
+      - name: Notify on failure
+        if: failure()
+        uses: actions/github-script@v6
+        with:
+          script: |
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: 'Scanner run failed',
+              body: 'The scheduled football scanner run failed. Check the logs for details.'
+            })
