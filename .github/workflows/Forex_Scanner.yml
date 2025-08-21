@@ -5,6 +5,10 @@ on:
     - cron: '0 3 * * *'  # 3 AM UK time daily (auto-adjusts for BST/GMT)
   workflow_dispatch:      # Manual trigger option
 
+permissions:
+  contents: read
+  issues: write  # This allows the workflow to create issues
+
 jobs:
   run-scanner:
     runs-on: ubuntu-latest
@@ -37,6 +41,7 @@ jobs:
         if: failure()
         uses: actions/github-script@v6
         with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             github.rest.issues.create({
               owner: context.repo.owner,
