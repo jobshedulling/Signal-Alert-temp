@@ -92,7 +92,7 @@ def get_fixtures(date):
                 debug_log(f"FootballData Error for {league_name}: {response.text[:200]}")
             
             # Respect API rate limits (10 requests per minute)
-            time.sleep(6)  # 6 seconds between league requests
+            time.sleep(10)  # 6 seconds between league requests
             
         except Exception as e:
             debug_log(f"FootballData Exception for {league_name}: {str(e)}")
