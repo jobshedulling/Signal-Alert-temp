@@ -15,7 +15,7 @@ FOOTBALL_DATA_TOKEN = os.environ.get("FOOTBALL_DATA_TOKEN")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# Top league competitions (Football-Data.org IDs) - Focus on top 7 leagues
+# Top league competitions (Football-Data.org IDs)
 TOP_LEAGUES = {
     "PL": 2021,        # Premier League
     "LaLiga": 2014,    # La Liga
@@ -36,7 +36,7 @@ FOOTBALL_DATA_HEADERS = {"X-Auth-Token": FOOTBALL_DATA_TOKEN}
 # Rate limiting variables
 last_request_time = 0
 request_lock = threading.Lock()
-MIN_REQUEST_INTERVAL = 9  # seconds (to stay under 10 requests/minute)
+MIN_REQUEST_INTERVAL = 6.1  # seconds (to stay under 10 requests/minute)
 
 def rate_limited_request():
     """Ensure we don't exceed API rate limits"""
@@ -53,6 +53,7 @@ def debug_log(message):
     print(f"[DEBUG][{timestamp}] {message}")
 
 def send_telegram(message):
+    """Send message to Telegram with proper error handling"""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
@@ -178,7 +179,7 @@ def get_team_history(team_id, is_home, opponent_id=None):
     return []
 
 def analyze_fixture(fixture):
-    """Improved prediction logic with flexible thresholds"""
+    """Improved prediction logic with flexible thresholds including BTS and Over/Under"""
     predictions = []
     
     # Get required data with football-data first
@@ -222,21 +223,29 @@ def analyze_fixture(fixture):
         if away_wins >= 3:
             predictions.append(f"W2 (Away Form: {away_wins}/{len(away_form)} wins)")
     
-    # Rule 3: Both Teams to Score (BTS)
+    # Rule 3: Both Teams to Score (BTS) - require at least 3 matches
     if len(h2h_matches) >= 3:
         bts_count = sum(1 for m in h2h_matches 
                       if m['score']['fullTime']['home'] > 0 and m['score']['fullTime']['away'] > 0)
         
-        if bts_count >= 3:
+        if bts_count >= 3:  # At least 3 of last 5 H2H had both teams scoring
             predictions.append(f"BTS (H2H: {bts_count}/{len(h2h_matches)} matches)")
     
-    # Rule 4: Over 2.5 Goals
+    # Rule 4: Over 2.5 Goals - require at least 3 matches
     if len(h2h_matches) >= 3:
         over_count = sum(1 for m in h2h_matches 
                        if m['score']['fullTime']['home'] + m['score']['fullTime']['away'] > 2.5)
         
-        if over_count >= 3:
+        if over_count >= 3:  # At least 3 of last 5 H2H had over 2.5 goals
             predictions.append(f"Over 2.5 (H2H: {over_count}/{len(h2h_matches)} matches)")
+    
+    # Rule 5: Under 2.5 Goals - require at least 3 matches
+    if len(h2h_matches) >= 3:
+        under_count = sum(1 for m in h2h_matches 
+                       if m['score']['fullTime']['home'] + m['score']['fullTime']['away'] < 2.5)
+        
+        if under_count >= 3:  # At least 3 of last 5 H2H had under 2.5 goals
+            predictions.append(f"Under 2.5 (H2H: {under_count}/{len(h2h_matches)} matches)")
     
     return predictions
 
@@ -272,6 +281,51 @@ def get_upcoming_match_dates(days=7):
     
     return match_dates if match_dates else [today.strftime("%Y-%m-%d")]
 
+def send_telegram_messages_by_date(date_signals, total_signals):
+    """Send Telegram messages split by date to avoid message length limits"""
+    uk_tz = pytz.timezone('Europe/London')
+    now_uk = datetime.now(uk_tz)
+    
+    # Send header message
+    header_message = (
+        f"⚽ <b>TOP LEAGUE PREDICTION SIGNALS</b> ⚽\n\n"
+        f"<b>Report Generated:</b> {now_uk.strftime('%Y-%m-%d %H:%M %Z')}\n"
+        f"<b>Total Signals:</b> {total_signals}\n\n"
+        "📊 <b>Breakdown by Date:</b>"
+    )
+    send_telegram(header_message)
+    time.sleep(1)
+    
+    # Send signals for each date in separate messages
+    for date_data in date_signals:
+        date_message = (
+            f"\n📅 <b>Date: {date_data['date']}</b>\n"
+            f"<b>Signals: {date_data['count']}/{date_data['total_fixtures']}</b>\n\n"
+        )
+        
+        # Add each match signal
+        for i, signal in enumerate(date_data['signals']):
+            date_message += f"{signal}\n\n"
+            
+            # Check if we're approaching Telegram's 4096 character limit
+            if len(date_message) > 3500 and i < len(date_data['signals']) - 1:
+                # Send current batch and start a new message for the same date
+                send_telegram(date_message)
+                time.sleep(1)
+                date_message = f"📅 <b>Date: {date_data['date']} (cont.)</b>\n\n"
+        
+        # Send the completed date message
+        send_telegram(date_message)
+        time.sleep(1)
+    
+    # Send footer with disclaimer
+    footer_message = (
+        "\n⚠️ <b>Disclaimer:</b> Predictions based on historical data analysis. "
+        "Past performance doesn't guarantee future results. "
+        "Always gamble responsibly."
+    )
+    send_telegram(footer_message)
+
 def main():
     # Get current UK time
     uk_tz = pytz.timezone('Europe/London')
@@ -281,7 +335,8 @@ def main():
     match_dates = get_upcoming_match_dates(7)
     debug_log(f"Found matches on these dates: {match_dates}")
     
-    all_signals = []
+    date_signals = []
+    total_signals = 0
     
     for match_date in match_dates:
         debug_log(f"======== SCANNING DATE: {match_date} ========")
@@ -304,7 +359,6 @@ def main():
                     match_info = (
                         f"<b>🏟 {fixture['home']} vs {fixture['away']}</b>\n"
                         f"<b>League:</b> {fixture['league']}\n"
-                        f"<b>Date:</b> {match_time.strftime('%Y-%m-%d')}\n"
                         f"<b>Time:</b> {match_time.strftime('%H:%M %Z')}\n"
                         f"<b>Predictions:</b>\n" + "\n".join([f"• {pred}" for pred in predictions])
                     )
@@ -317,40 +371,18 @@ def main():
             time.sleep(1.5)  # Rate limiting between fixtures
         
         if signals:
-            all_signals.append({
+            date_signals.append({
                 "date": match_date,
                 "signals": signals,
                 "count": len(signals),
                 "total_fixtures": len(fixtures)
             })
+            total_signals += len(signals)
     
-    # Send consolidated report
-    if all_signals:
-        message = "⚽ <b>TOP LEAGUE PREDICTION SIGNALS</b> ⚽\n\n"
-        
-        for date_data in all_signals:
-            message += (
-                f"<b>📅 Date: {date_data['date']}</b>\n"
-                f"<b>Signals: {date_data['count']}/{date_data['total_fixtures']}</b>\n\n"
-                + "\n\n".join(date_data['signals']) + "\n\n"
-            )
-        
-        message += (
-            f"<b>Report Generated:</b> {now_uk.strftime('%Y-%m-%d %H:%M %Z')}\n"
-            f"<b>Total Signals:</b> {sum(d['count'] for d in all_signals)}\n\n"
-            "<i>Disclaimer: Predictions based on historical data analysis. Past performance doesn't guarantee future results.</i>"
-        )
-        
-        # Split message if too long for Telegram (max 4096 characters)
-        if len(message) > 4000:
-            parts = [message[i:i+4000] for i in range(0, len(message), 4000)]
-            for part in parts:
-                send_telegram(part)
-                time.sleep(1)
-        else:
-            send_telegram(message)
-            
-        debug_log(f"Sent {sum(d['count'] for d in all_signals)} signals to Telegram")
+    # Send consolidated report split by date
+    if date_signals:
+        send_telegram_messages_by_date(date_signals, total_signals)
+        debug_log(f"Sent {total_signals} signals to Telegram")
     else:
         send_telegram(
             f"ℹ️ <b>No Prediction Signals Found</b>\n\n"
