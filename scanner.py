@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 import warnings
 import pytz
 import threading
+import json
 
 # Suppress SSL warnings
 warnings.filterwarnings('ignore', message='Unverified HTTPS request')
@@ -36,7 +37,10 @@ FOOTBALL_DATA_HEADERS = {"X-Auth-Token": FOOTBALL_DATA_TOKEN}
 # Rate limiting variables
 last_request_time = 0
 request_lock = threading.Lock()
-MIN_REQUEST_INTERVAL = 6.1  # seconds (to stay under 10 requests/minute)
+MIN_REQUEST_INTERVAL = 8.0  # seconds (safer for free tier)
+
+# File to store predictions
+PREDICTIONS_FILE = "predictions.json"
 
 def rate_limited_request():
     """Ensure we don't exceed API rate limits"""
@@ -223,29 +227,51 @@ def analyze_fixture(fixture):
         if away_wins >= 3:
             predictions.append(f"W2 (Away Form: {away_wins}/{len(away_form)} wins)")
     
-    # Rule 3: Both Teams to Score (BTS) - require at least 3 matches
-    if len(h2h_matches) >= 3:
-        bts_count = sum(1 for m in h2h_matches 
-                      if m['score']['fullTime']['home'] > 0 and m['score']['fullTime']['away'] > 0)
+    # Rule 3: Both Teams to Score (BTS) - based on home/away form and H2H
+    if len(home_form) >= 3 and len(away_form) >= 3 and len(h2h_matches) >= 2:
+        # Check home team's last 3 home matches for BTS
+        home_bts_count = 0
+        for match in home_form[:3]:  # Last 3 home matches
+            if match['score']['fullTime']['home'] > 0 and match['score']['fullTime']['away'] > 0:
+                home_bts_count += 1
         
-        if bts_count >= 3:  # At least 3 of last 5 H2H had both teams scoring
-            predictions.append(f"BTS (H2H: {bts_count}/{len(h2h_matches)} matches)")
+        # Check away team's last 3 away matches for BTS
+        away_bts_count = 0
+        for match in away_form[:3]:  # Last 3 away matches
+            if match['score']['fullTime']['home'] > 0 and match['score']['fullTime']['away'] > 0:
+                away_bts_count += 1
+        
+        # Check last 2 H2H matches for BTS
+        h2h_bts_count = 0
+        for match in h2h_matches[:2]:  # Last 2 H2H matches
+            if match['score']['fullTime']['home'] > 0 and match['score']['fullTime']['away'] > 0:
+                h2h_bts_count += 1
+        
+        if home_bts_count >= 2 and away_bts_count >= 2 and h2h_bts_count >= 1:
+            predictions.append(f"BTS (Home: {home_bts_count}/3, Away: {away_bts_count}/3, H2H: {h2h_bts_count}/2)")
     
-    # Rule 4: Over 2.5 Goals - require at least 3 matches
-    if len(h2h_matches) >= 3:
-        over_count = sum(1 for m in h2h_matches 
-                       if m['score']['fullTime']['home'] + m['score']['fullTime']['away'] > 2.5)
+    # Rule 4: Over 2.5 Goals - based on home/away form and H2H
+    if len(home_form) >= 3 and len(away_form) >= 3 and len(h2h_matches) >= 2:
+        # Check home team's last 3 home matches for Over 2.5
+        home_over_count = 0
+        for match in home_form[:3]:
+            if match['score']['fullTime']['home'] + match['score']['fullTime']['away'] > 2.5:
+                home_over_count += 1
         
-        if over_count >= 3:  # At least 3 of last 5 H2H had over 2.5 goals
-            predictions.append(f"Over 2.5 (H2H: {over_count}/{len(h2h_matches)} matches)")
-    
-    # Rule 5: Under 2.5 Goals - require at least 3 matches
-    if len(h2h_matches) >= 3:
-        under_count = sum(1 for m in h2h_matches 
-                       if m['score']['fullTime']['home'] + m['score']['fullTime']['away'] < 2.5)
+        # Check away team's last 3 away matches for Over 2.5
+        away_over_count = 0
+        for match in away_form[:3]:
+            if match['score']['fullTime']['home'] + match['score']['fullTime']['away'] > 2.5:
+                away_over_count += 1
         
-        if under_count >= 3:  # At least 3 of last 5 H2H had under 2.5 goals
-            predictions.append(f"Under 2.5 (H2H: {under_count}/{len(h2h_matches)} matches)")
+        # Check last 2 H2H matches for Over 2.5
+        h2h_over_count = 0
+        for match in h2h_matches[:2]:
+            if match['score']['fullTime']['home'] + match['score']['fullTime']['away'] > 2.5:
+                h2h_over_count += 1
+        
+        if home_over_count >= 2 and away_over_count >= 2 and h2h_over_count >= 1:
+            predictions.append(f"Over 2.5 (Home: {home_over_count}/3, Away: {away_over_count}/3, H2H: {h2h_over_count}/2)")
     
     return predictions
 
@@ -326,7 +352,118 @@ def send_telegram_messages_by_date(date_signals, total_signals):
     )
     send_telegram(footer_message)
 
+def save_predictions(predictions):
+    """Save predictions to a JSON file for future result checking"""
+    try:
+        # Load existing predictions if any
+        if os.path.exists(PREDICTIONS_FILE):
+            with open(PREDICTIONS_FILE, 'r') as f:
+                existing_data = json.load(f)
+        else:
+            existing_data = []
+        
+        # Add new predictions
+        for prediction in predictions:
+            existing_data.append(prediction)
+        
+        # Save back to file
+        with open(PREDICTIONS_FILE, 'w') as f:
+            json.dump(existing_data, f, indent=4)
+        
+        debug_log(f"Saved {len(predictions)} predictions to {PREDICTIONS_FILE}")
+    except Exception as e:
+        debug_log(f"Error saving predictions: {str(e)}")
+
+def check_previous_predictions():
+    """Check results of previous predictions and calculate win rate"""
+    try:
+        if not os.path.exists(PREDICTIONS_FILE):
+            debug_log("No previous predictions file found.")
+            return None
+        
+        with open(PREDICTIONS_FILE, 'r') as f:
+            predictions = json.load(f)
+        
+        # Filter predictions for matches that have been played (match date is past)
+        uk_tz = pytz.timezone('Europe/London')
+        now_uk = datetime.now(uk_tz)
+        checked_predictions = []
+        results = {
+            'W1': {'correct': 0, 'total': 0},
+            'W2': {'correct': 0, 'total': 0},
+            'BTS': {'correct': 0, 'total': 0},
+            'Over 2.5': {'correct': 0, 'total': 0}
+        }
+        
+        for pred in predictions:
+            match_date = datetime.fromisoformat(pred['match_date'].replace('Z', '+00:00')).astimezone(uk_tz)
+            if match_date < now_uk:
+                # Match has been played, check result
+                try:
+                    # Get match result from API
+                    url = f"https://api.football-data.org/v4/matches/{pred['match_id']}"
+                    rate_limited_request()
+                    response = requests.get(url, headers=FOOTBALL_DATA_HEADERS, timeout=10)
+                    if response.status_code == 200:
+                        data = response.json()
+                        match = data.get('match', {})
+                        if match.get('status') == 'FINISHED':
+                            home_score = match['score']['fullTime']['home']
+                            away_score = match['score']['fullTime']['away']
+                            
+                            # Check each prediction type
+                            for prediction_type in pred['predictions']:
+                                if prediction_type.startswith('W1'):
+                                    results['W1']['total'] += 1
+                                    if home_score > away_score:
+                                        results['W1']['correct'] += 1
+                                elif prediction_type.startswith('W2'):
+                                    results['W2']['total'] += 1
+                                    if away_score > home_score:
+                                        results['W2']['correct'] += 1
+                                elif prediction_type.startswith('BTS'):
+                                    results['BTS']['total'] += 1
+                                    if home_score > 0 and away_score > 0:
+                                        results['BTS']['correct'] += 1
+                                elif prediction_type.startswith('Over 2.5'):
+                                    results['Over 2.5']['total'] += 1
+                                    if home_score + away_score > 2.5:
+                                        results['Over 2.5']['correct'] += 1
+                            
+                            # Mark as checked
+                            checked_predictions.append(pred)
+                except Exception as e:
+                    debug_log(f"Error checking match {pred['match_id']}: {str(e)}")
+        
+        # Remove checked predictions from file
+        unchecked_predictions = [p for p in predictions if p not in checked_predictions]
+        with open(PREDICTIONS_FILE, 'w') as f:
+            json.dump(unchecked_predictions, f, indent=4)
+        
+        # Calculate win rates
+        win_rates = {}
+        for key, value in results.items():
+            if value['total'] > 0:
+                win_rates[key] = f"{value['correct']}/{value['total']} ({(value['correct']/value['total'])*100:.2f}%)"
+            else:
+                win_rates[key] = "No data"
+        
+        return win_rates
+    except Exception as e:
+        debug_log(f"Error checking previous predictions: {str(e)}")
+        return None
+
 def main():
+    # Check previous predictions and log win rates
+    win_rates = check_previous_predictions()
+    if win_rates:
+        debug_log(f"Previous prediction win rates: {win_rates}")
+        # Send win rates to Telegram if desired
+        win_message = "📊 <b>Prediction Win Rates (Last Run):</b>\n"
+        for key, value in win_rates.items():
+            win_message += f"{key}: {value}\n"
+        send_telegram(win_message)
+    
     # Get current UK time
     uk_tz = pytz.timezone('Europe/London')
     now_uk = datetime.now(uk_tz)
@@ -337,6 +474,7 @@ def main():
     
     date_signals = []
     total_signals = 0
+    all_predictions_to_save = []  # To save predictions for future checking
     
     for match_date in match_dates:
         debug_log(f"======== SCANNING DATE: {match_date} ========")
@@ -364,6 +502,16 @@ def main():
                     )
                     signals.append(match_info)
                     debug_log(f"Signal found: {predictions}")
+                    
+                    # Save prediction for future checking
+                    prediction_record = {
+                        'match_id': fixture['id'],
+                        'match_date': fixture['date'],
+                        'home': fixture['home'],
+                        'away': fixture['away'],
+                        'predictions': predictions
+                    }
+                    all_predictions_to_save.append(prediction_record)
                 else:
                     debug_log("No predictions met criteria")
             except Exception as e:
@@ -378,6 +526,10 @@ def main():
                 "total_fixtures": len(fixtures)
             })
             total_signals += len(signals)
+    
+    # Save predictions to file
+    if all_predictions_to_save:
+        save_predictions(all_predictions_to_save)
     
     # Send consolidated report split by date
     if date_signals:
